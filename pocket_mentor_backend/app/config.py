@@ -1,6 +1,8 @@
 from pydantic_settings import BaseSettings
 from typing import Optional
 
+GEMINI_API_KEY: Optional[str] = None
+
 
 class Settings(BaseSettings):
     APP_NAME: str = "Pocket Mentor"
