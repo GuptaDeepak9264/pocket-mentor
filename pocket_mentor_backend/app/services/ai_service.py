@@ -1,11 +1,9 @@
 import os
 import json
-import urllib.request
-import urllib.error
+import httpx
 from abc import ABC, abstractmethod
 from typing import Optional
 from app.config import settings
-
 
 class GeneratedCard:
     def __init__(self, question: str, answer: str, 
@@ -15,16 +13,22 @@ class GeneratedCard:
         self.hint = hint
         self.difficulty = difficulty
 
+    def to_dict(self):
+        return {
+            "question": self.question,
+            "answer": self.answer,
+            "hint": self.hint,
+            "difficulty": self.difficulty
+        }
+
 
 class BaseAIService(ABC):
     @abstractmethod
-    async def generate_cards(self, text: str, topic: str, 
-                             count: int = 10) -> list[GeneratedCard]:
+    async def generate_cards(self, text: str, topic: str, count: int = 10) -> list[GeneratedCard]:
         pass
 
     @abstractmethod
-    async def evaluate_answer(self, question: str, 
-                              user_answer: str, correct_answer: str) -> float:
+    async def evaluate_answer(self, question: str, user_answer: str, correct_answer: str) -> float:
         pass
 
     @abstractmethod
@@ -33,86 +37,66 @@ class BaseAIService(ABC):
 
 
 class GeminiAIService(BaseAIService):
-    """Uses Google Gemini API to generate flashcards."""
+    """Uses Google Gemini API to generate flashcards and evaluate metrics asynchronously."""
 
     def __init__(self, api_key: str):
         self.api_key = api_key
-        self.url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"gemini-1.5-flash:generateContent?key={api_key}"
-        )
+        self.url = f"[https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=](https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=){api_key}"
 
-    async def generate_cards(self, text: str, topic: str,
-                             count: int = 10) -> list[GeneratedCard]:
-        import asyncio
-
-        prompt = f"""You are a flashcard generator. Given the following text about "{topic}", 
+    async def generate_cards(self, text: str, topic: str, count: int = 10) -> list[GeneratedCard]:
+        prompt = f"""You are an advanced flashcard generator. Given the provided text about "{topic}", 
 generate exactly {count} high-quality question-answer flashcard pairs.
 
 Rules:
-- Questions should test understanding, not just memory
-- Answers should be clear and concise (1-3 sentences)
-- Vary difficulty from easy to hard
-- Return ONLY valid JSON, no markdown, no explanation
-
-Return this exact JSON format:
-[
-  {{
-    "question": "What is...?",
-    "answer": "It is...",
-    "hint": "Think about...",
-    "difficulty": 3
-  }}
-]
+- Questions must test deep understanding of the concepts, not just raw memory.
+- Answers must be clear, accurate, and concise (1-3 sentences).
+- Vary the difficulty level dynamically from 1 (easiest) to 5 (hardest).
+- Your entire response MUST comply with the requested JSON schema.
 
 Text to process:
 {text[:4000]}"""
 
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, self._call_api, prompt)
-        return result
-
-    def _call_api(self, prompt: str) -> list[GeneratedCard]:
-        payload = json.dumps({
+        # Enforce JSON output format natively via Gemini Config
+        payload = {
             "contents": [{"parts": [{"text": prompt}]}],
             "generationConfig": {
-                "temperature": 0.7,
-                "maxOutputTokens": 2048,
+                "temperature": 0.3,  # Lower temperature for deterministic structural schemas
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "ARRAY",
+                    "items": {
+                        "type": "OBJECT",
+                        "properties": {
+                            "question": {"type": "STRING"},
+                            "answer": {"type": "STRING"},
+                            "hint": {"type": "STRING"},
+                            "difficulty": {"type": "INTEGER"}
+                        },
+                        "required": ["question", "answer", "difficulty"]
+                    }
+                }
             }
-        }).encode("utf-8")
-
-        req = urllib.request.Request(
-            self.url,
-            data=payload,
-            headers={"Content-Type": "application/json"},
-            method="POST"
-        )
+        }
 
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-                text = data["candidates"][0]["content"]["parts"][0]["text"]
-
-                # Clean JSON
-                text = text.strip()
-                if text.startswith("```"):
-                    text = text.split("```")[1]
-                    if text.startswith("json"):
-                        text = text[4:]
-                text = text.strip()
-
-                cards_data = json.loads(text)
-                cards = []
-                for c in cards_data:
-                    cards.append(GeneratedCard(
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(self.url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                
+                raw_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                cards_data = json.loads(raw_text)
+                
+                return [
+                    GeneratedCard(
                         question=c.get("question", ""),
                         answer=c.get("answer", ""),
                         hint=c.get("hint"),
-                        difficulty=int(c.get("difficulty", 3)),
-                    ))
-                return cards
+                        difficulty=int(c.get("difficulty", 3))
+                    ) for c in cards_data
+                ]
         except Exception as e:
-            print(f"Gemini API error: {e}")
+            print(f"❌ Gemini API Error in generate_cards: {e}")
             return self._fallback_cards()
 
     def _fallback_cards(self) -> list[GeneratedCard]:
@@ -122,26 +106,72 @@ Text to process:
             difficulty=3
         )]
 
-    async def evaluate_answer(self, question: str,
-                              user_answer: str, correct_answer: str) -> float:
-        user_words = set(user_answer.lower().split())
-        correct_words = set(correct_answer.lower().split())
-        if not correct_words:
-            return 0.0
-        return round(len(user_words & correct_words) / len(correct_words), 2)
+    async def evaluate_answer(self, question: str, user_answer: str, correct_answer: str) -> float:
+        """Uses LLM semantic matching rather than raw word counts to evaluate user accuracy."""
+        prompt = f"""Evaluate the accuracy of the user's answer compared to the correct reference answer for the given question.
+Return a score between 0.0 (completely wrong) and 1.0 (completely correct) as a JSON object containing a singular float key 'score'.
+
+Question: "{question}"
+Correct Reference Answer: "{correct_answer}"
+User's Answer: "{user_answer}"
+"""
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.0,
+                "responseMimeType": "application/json",
+                "responseSchema": {
+                    "type": "OBJECT",
+                    "properties": {
+                        "score": {"type": "NUMBER"}
+                    },
+                    "required": ["score"]
+                }
+            }
+        }
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(self.url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                res_text = data["candidates"][0]["content"]["parts"][0]["text"]
+                return float(json.loads(res_text).get("score", 0.0))
+        except Exception as e:
+            print(f"⚠️ AI evaluation failed ({e}). Falling back to word intersection logic.")
+            # Fallback to local string handling if API times out
+            user_words = set(user_answer.lower().split())
+            correct_words = set(correct_answer.lower().split())
+            if not correct_words: return 0.0
+            return round(len(user_words & correct_words) / len(correct_words), 2)
 
     async def generate_hint(self, question: str, answer: str) -> str:
-        words = answer.split()
-        if len(words) <= 3:
-            return f"Starts with '{answer[0]}...'"
-        return f"Starts with: '{' '.join(words[:2])}...'"
+        """Generates contextual hints instead of plain string truncation."""
+        prompt = f"""Provide a short, subtle, helpful hint for a user trying to answer this question. 
+Do not reveal the actual answer.
+
+Question: "{question}"
+Answer: "{answer}"
+"""
+        payload = {
+            "contents": [{"parts": [{"text": prompt}]}],
+            "generationConfig": {"temperature": 0.5, "maxOutputTokens": 60}
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.post(self.url, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                return data["candidates"][0]["content"]["parts"][0]["text"].strip()
+        except Exception:
+            words = answer.split()
+            return f"Starts with: '{' '.join(words[:2])}...'"
 
 
 class RulesBasedAIService(BaseAIService):
-    """Fallback when no API key available."""
+    """Local text parsing fallback when no API key is initialized."""
 
-    async def generate_cards(self, text: str, topic: str,
-                             count: int = 10) -> list[GeneratedCard]:
+    async def generate_cards(self, text: str, topic: str, count: int = 10) -> list[GeneratedCard]:
         import re
         sentences = re.split(r'(?<=[.!?])\s+', text)
         cards = []
@@ -164,8 +194,7 @@ class RulesBasedAIService(BaseAIService):
                 break
         return cards[:count]
 
-    async def evaluate_answer(self, question: str,
-                              user_answer: str, correct_answer: str) -> float:
+    async def evaluate_answer(self, question: str, user_answer: str, correct_answer: str) -> float:
         user_words = set(user_answer.lower().split())
         correct_words = set(correct_answer.lower().split())
         if not correct_words:
@@ -180,10 +209,10 @@ class RulesBasedAIService(BaseAIService):
 
 
 def get_ai_service() -> BaseAIService:
-    """Returns Gemini if API key set, else rules-based."""
+    """Instantiates the correct service context."""
     api_key = os.environ.get("GEMINI_API_KEY") or getattr(settings, "GEMINI_API_KEY", None)
     if api_key:
-        print(f"✅ Using Gemini AI service")
+        print(f"✅ Using Gemini Asynchronous AI service")
         return GeminiAIService(api_key=api_key)
-    print("⚠️  No GEMINI_API_KEY found, using rules-based service")
+    print("⚠️ No GEMINI_API_KEY found, fallback to rules-based processing")
     return RulesBasedAIService()
