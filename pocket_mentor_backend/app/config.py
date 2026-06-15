@@ -1,11 +1,9 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict # 1. Import SettingsConfigDict
 from typing import Optional
-
-GEMINI_API_KEY: Optional[str] = None
-
 
 class Settings(BaseSettings):
     APP_NAME: str = "Pocket Mentor"
+    GEMINI_API_KEY: Optional[str] = None
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = True
 
@@ -35,9 +33,11 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: Optional[str] = None
     ANTHROPIC_API_KEY: Optional[str] = None
 
-    class Config:
-        env_file = ".env"
-        case_sensitive = True
-
+    # 2. Replace the old class Config with model_config
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=True,
+        extra="ignore" # Good practice: ignores extra vars in your .env without crashing
+    )
 
 settings = Settings()
